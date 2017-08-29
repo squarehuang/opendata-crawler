@@ -1,0 +1,165 @@
+# -*- coding: utf-8 -*-
+import scrapy
+import requests
+import json
+import logging
+from scrapy.conf import settings
+import os
+import shutil
+import zipfile
+from scrapy.http import Request
+import traceback
+from scrapy import signals
+from scrapy.xlib.pydispatch import dispatcher
+import csv
+logger = logging.getLogger('DataGovTwSpiderLogger')
+
+
+class DataGovTwSpider(scrapy.Spider):
+    name="data_gov_tw"
+    allow_domains=["data.gov.tw"]
+    mapping_columns = ['filename','id','Name_t','field_body_value_s','changedDate_dt','field_field_fielddesc_value_s','field_character_set_code_g_value_s']
+    mapping_dict = {}
+
+    def get_start_urls(self):
+        start_urls={
+        "http://search.data.gov.tw/wise/query?format=json&q=%E5%85%AC%E5%8F%B8%E7%99%BB%E8%A8%98%E4%BE%9D%E7%87%9F%E6%A5%AD%E9%A0%85%E7%9B%AE%E5%88%A5&sort=score+desc&d=1&rows=10&start=0":"company-registration"
+        }
+        return start_urls
+
+    def get_download_store_path(self):
+        sub_path = settings.get('DOWNLOAD_STORE_PATH')
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        print project_root
+        download_store_path = os.path.join(os.path.sep,project_root,sub_path)
+        try:
+            if os.path.isdir(download_store_path) == False:
+                os.makedirs(download_store_path)
+                logger.info('mkdir {} folder '.format(download_store_path))
+        except Exception as e:
+            logger.warning('mkdir {} folder failed '.format(download_store_path))
+            logger.warning(str(e))
+            raise e
+
+        return download_store_path
+
+
+    def __init__(self):
+        dispatcher.connect(self.spider_closed, signals.spider_closed)
+        self.start_urls = self.get_start_urls()
+        self.download_store_path = self.get_download_store_path()
+        self.proxies = settings.get('PROXIES_FOR_REQUESTS')
+        self.mapping_filename = settings.get('MAPPING_FILENAME') + '.csv'
+
+    def start_requests(self):
+        for url in self.start_urls.keys():
+            yield scrapy.Request(url, meta={'name': self.start_urls.get(url)},callback=self.parse)
+
+# write mapping file
+    def spider_closed(self, spider):
+        mapping_file_path = os.path.join(os.path.sep,self.download_store_path,self.mapping_filename)
+        with open(mapping_file_path, 'w') as mapping_file:
+            wr = csv.writer(mapping_file, quoting=csv.QUOTE_ALL)
+            wr.writerow(self.mapping_columns)
+            for key,line in self.mapping_dict.iteritems():
+                wr.writerow([col.encode('utf-8') for col in line])
+
+    def parse(self,response):
+        name = response.meta.get('name')
+        datas_col = 'docs'
+        next_url = self.get_next_link(response.url)
+        page_obj = json.loads(response.body)
+        datas_obj = page_obj['page'][0]
+        if datas_col not in datas_obj:
+            logger.info('not find {} column,finish!'.format(datas_col))
+            return
+        else:
+            if len(datas_obj[datas_col]) == 0:
+                logger.info('{} data length : {},finish!'.format(datas_col,len(datas_obj[datas_col])))
+                return
+
+            for item in datas_obj[datas_col]:
+                yield self.parse_item(item,name)
+
+        if next_url != None:
+            yield scrapy.Request(url=next_url,
+                    callback=self.parse,meta={'name': name})
+
+    def parse_item(self,response,query_condition):
+        try:
+            filename = '{}-{}'.format(query_condition,response['id'])
+            # append to mapping list
+            if filename not in self.mapping_dict:
+                submapping_list = []
+                # filename
+                submapping_list.append(filename)
+                for column in self.mapping_columns:
+                    if column in response:
+                        submapping_list.append(response[column].strip('\t\n\r'))
+                self.mapping_dict[filename] = submapping_list
+
+            extension_zip_filename = 'zip'
+            download_url = response['field_resource_url_g_url_s']
+            logger.info('name :{}-> download_url: {}'.format(filename.encode('utf-8'),download_url.encode('utf-8')))
+            local_zip_filename = os.path.join(os.path.sep,self.download_store_path,filename) + '.' + extension_zip_filename
+
+            # # unzip file
+            extension_filename = response['mimetype_ms'].lower()
+            local_filename = os.path.join(os.path.sep,self.download_store_path,filename) + '.' + extension_filename
+            return scrapy.Request(download_url, callback=self.save_file,meta={'local_zip_filename': local_zip_filename,'local_filename':local_filename})
+
+
+        except Exception as e:
+            logger.warning(e)
+            logger.warning('parse_item failed : {}'.format(str(e)))
+
+    def save_file(self, response):
+        logger.info('response status code : {}'.format(str(response.status)))
+        local_zip_filename = response.meta.get('local_zip_filename')
+        local_filename = response.meta.get('local_filename')
+
+        logger.info('save_file : {}'.format(local_filename))
+        with open(local_zip_filename.encode('utf-8'), 'wb') as f:
+            f.write(response.body)
+        # unzip file
+        fh = open(local_zip_filename.encode('utf-8'), 'rb')
+        z = zipfile.ZipFile(fh)
+        for name in z.namelist():
+            z.extract(name, self.download_store_path)
+            shutil.move(os.path.join(self.download_store_path,name), local_filename)
+        fh.close()
+
+        # delete zip file
+        os.remove(local_zip_filename.encode('utf-8'))
+
+    def get_next_link(self,this_url):
+        # split query url and parameters
+        try:
+            front_url = this_url.split('?')[0]
+            query_params_str = this_url.split('?')[1]
+            query_params = query_params_str.split('&')
+            param_dict = {}
+
+            for param in query_params:
+                param_key = param.split('=')[0]
+                param_value = param.split('=')[1]
+                param_dict[param_key] = param_value
+            # rows=100&start=0
+            start_index = int(param_dict['start'])
+            rows = int(param_dict['rows'])
+            start_index += rows
+            param_dict['start'] = str(start_index)
+
+            temp_url = front_url + '?'
+            for key,value in param_dict.iteritems():
+                temp_url += '{}={}&'.format(key,value)
+
+            final_url = temp_url[:-1]
+
+        except Exception, e:
+            logger.warning('get_next_link failed')
+            logger.warning(str(e))
+            final_url = None
+        finally:
+            logger.info('next_link : {}'.format(final_url))
+            return final_url
